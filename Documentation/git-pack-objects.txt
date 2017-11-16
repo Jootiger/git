@@ -242,9 +242,19 @@ So does `git bundle` (see linkgit:git-bundle[1]) when it creates a bundle.
 	the resulting packfile.  See linkgit:git-rev-list[1] for valid
 	`<filter-spec>` forms.
 
---missing=(error|allow-any):
+--missing=(error|allow-any|allow-promisor):
 	Specifies how missing objects are handled.  This is useful, for
 	example, when there are missing objects from a prior partial clone.
+	This is stronger than `--missing=allow-promisor` because it limits
+	the traversal, rather than just silencing errors about missing
+	objects.
+
+--exclude-promisor-objects::
+	Omit objects that are known to be in the promisor remote". (This
+	option has the purpose of operating only on locally created objects,
+	so that when we repack, we still maintain a distinction between
+	locally created objects [without .promisor] and objects from the
+	promisor remote [with .promisor].)  This is used with partial clone.
 
 SEE ALSO
 --------
