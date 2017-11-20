@@ -3086,7 +3086,7 @@ _git_whatchanged ()
 
 _git_worktree ()
 {
-	local subcommands="add list lock prune unlock"
+	local subcommands="add list lock move prune remove unlock"
 	local subcommand="$(__git_find_on_cmdline "$subcommands")"
 	if [ -z "$subcommand" ]; then
 		__gitcomp "$subcommands"
@@ -3103,6 +3103,9 @@ _git_worktree ()
 			;;
 		prune,--*)
 			__gitcomp "--dry-run --expire --verbose"
+			;;
+		remove,--*)
+			__gitcomp "--force"
 			;;
 		*)
 			;;
