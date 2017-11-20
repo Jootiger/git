@@ -1142,8 +1142,8 @@ static int do_commit(const char *msg_file, const char *author,
 			unlink(git_path_cherry_pick_head());
 			unlink(git_path_merge_msg());
 			if (!is_rebase_i(opts))
-				res = print_commit_summary(NULL, &oid,
-						SUMMARY_SHOW_AUTHOR_DATE);
+				print_commit_summary(NULL, &oid,
+						     SUMMARY_SHOW_AUTHOR_DATE);
 			return res;
 		}
 	}
