@@ -369,21 +369,48 @@ test_expect_success 'OpenSSH variant passes -4' '
 	expect_ssh "-4 -p 123" myhost src
 '
 
-test_expect_success 'variant can be overriden' '
-	git -c ssh.variant=simple clone -4 "[myhost:123]:src" ssh-simple-clone &&
-	expect_ssh myhost src
+test_expect_success 'variant can be overridden' '
+	copy_ssh_wrapper_as "$TRASH_DIRECTORY/putty" &&
+	git -c ssh.variant=putty clone -4 "[myhost:123]:src" ssh-putty-clone &&
+	expect_ssh "-4 -P 123" myhost src
 '
 
-test_expect_success 'simple is treated as simple' '
+test_expect_success 'variant=auto picks based on basename' '
+	copy_ssh_wrapper_as "$TRASH_DIRECTORY/plink" &&
+	git -c ssh.variant=auto clone -4 "[myhost:123]:src" ssh-auto-clone &&
+	expect_ssh "-4 -P 123" myhost src
+'
+
+test_expect_success 'simple does not support -4/-6' '
 	copy_ssh_wrapper_as "$TRASH_DIRECTORY/simple" &&
-	git clone -4 "[myhost:123]:src" ssh-bracket-clone-simple &&
-	expect_ssh myhost src
+	test_must_fail git clone -4 "myhost:src" ssh-4-clone-simple
+'
+
+test_expect_success 'simple does not support port' '
+	copy_ssh_wrapper_as "$TRASH_DIRECTORY/simple" &&
+	test_must_fail git clone "[myhost:123]:src" ssh-bracket-clone-simple
 '
 
 test_expect_success 'uplink is treated as simple' '
 	copy_ssh_wrapper_as "$TRASH_DIRECTORY/uplink" &&
-	git clone "[myhost:123]:src" ssh-bracket-clone-uplink &&
+	test_when_finished "rm \"$TRASH_DIRECTORY/uplink$X\"" &&
+	test_must_fail git clone "[myhost:123]:src" ssh-bracket-clone-uplink &&
+	git clone "myhost:src" ssh-clone-uplink &&
 	expect_ssh myhost src
+'
+
+test_expect_success 'OpenSSH-like uplink is treated as ssh' '
+	write_script "$TRASH_DIRECTORY/uplink" <<-EOF &&
+	if test "\$1" = "-G"
+	then
+		exit 0
+	fi &&
+	exec "\$TRASH_DIRECTORY/ssh$X" "\$@"
+	EOF
+	GIT_SSH="$TRASH_DIRECTORY/uplink" &&
+	export GIT_SSH &&
+	git clone "[myhost:123]:src" ssh-bracket-clone-sshlike-uplink &&
+	expect_ssh "-p 123" myhost src
 '
 
 test_expect_success 'plink is treated specially (as putty)' '
