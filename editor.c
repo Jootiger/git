@@ -40,6 +40,28 @@ int launch_editor(const char *path, struct strbuf *buffer, const char *const *en
 		const char *args[] = { editor, real_path(path), NULL };
 		struct child_process p = CHILD_PROCESS_INIT;
 		int ret, sig;
+		static const char *close_notice = NULL;
+
+		if (isatty(2) && !close_notice) {
+			char *term = getenv("TERM");
+
+			if (term && strcmp(term, "dumb"))
+				/*
+				 * go back to the beginning and erase the
+				 * entire line if the terminal is capable
+				 * to do so, to avoid wasting the vertical
+				 * space.
+				 */
+				close_notice = "\r\033[K";
+			else
+				/* otherwise, complete and waste the line */
+				close_notice = "done.\n";
+		}
+
+		if (close_notice) {
+			fprintf(stderr, "Waiting for you to finish editing...");
+			fflush(stderr);
+		}
 
 		p.argv = args;
 		p.env = env;
@@ -58,6 +80,8 @@ int launch_editor(const char *path, struct strbuf *buffer, const char *const *en
 		if (ret)
 			return error("There was a problem with the editor '%s'.",
 					editor);
+		if (close_notice)
+			fputs(close_notice, stderr);
 	}
 
 	if (!buffer)
