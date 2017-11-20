@@ -20,6 +20,7 @@
 #include "split-index.h"
 #include "utf8.h"
 #include "fsmonitor.h"
+#include "thread-utils.h"
 
 /* Mask for the name length in ce_flags in the on-disk index */
 
@@ -40,6 +41,7 @@
 #define CACHE_EXT_LINK 0x6c696e6b	  /* "link" */
 #define CACHE_EXT_UNTRACKED 0x554E5452	  /* "UNTR" */
 #define CACHE_EXT_FSMONITOR 0x46534D4E	  /* "FSMN" */
+#define CACHE_EXT_FASTINDEX 0x49454F54	  /* "IEOT" */
 
 /* changes that can be kept in $GIT_DIR/index (basically all extensions) */
 #define EXTMASK (RESOLVE_UNDO_CHANGED | CACHE_TREE_CHANGED | \
@@ -1586,6 +1588,9 @@ static int read_index_extension(struct index_state *istate,
 	case CACHE_EXT_FSMONITOR:
 		read_fsmonitor_extension(istate, data, sz);
 		break;
+	case CACHE_EXT_FASTINDEX:
+		/* already handled in do_read_index() */
+		break;
 	default:
 		if (*ext < 'A' || 'Z' < *ext)
 			return error("index uses %.4s extension, which we do not understand",
@@ -1639,10 +1644,12 @@ static struct cache_entry *cache_entry_from_ondisk(struct ondisk_cache_entry *on
  * number of bytes to be stripped from the end of the previous name,
  * and the bytes to append to the result, to come up with its name.
  */
-static unsigned long expand_name_field(struct strbuf *name, const char *cp_)
+static unsigned long expand_name_field(struct strbuf *name, const char *cp_, int use_length)
 {
 	const unsigned char *ep, *cp = (const unsigned char *)cp_;
 	size_t len = decode_varint(&cp);
+	if (!use_length)
+		len = name->len;
 
 	if (name->len < len)
 		die("malformed name field in the index");
@@ -1653,9 +1660,10 @@ static unsigned long expand_name_field(struct strbuf *name, const char *cp_)
 	return (const char *)ep + 1 - cp_;
 }
 
-static struct cache_entry *create_from_disk(struct ondisk_cache_entry *ondisk,
+struct cache_entry *create_from_disk(struct ondisk_cache_entry *ondisk,
 					    unsigned long *ent_size,
-					    struct strbuf *previous_name)
+					    struct strbuf *previous_name,
+						int use_length)
 {
 	struct cache_entry *ce;
 	size_t len;
@@ -1689,7 +1697,7 @@ static struct cache_entry *create_from_disk(struct ondisk_cache_entry *ondisk,
 		*ent_size = ondisk_ce_size(ce);
 	} else {
 		unsigned long consumed;
-		consumed = expand_name_field(previous_name, name);
+		consumed = expand_name_field(previous_name, name, use_length);
 		ce = cache_entry_from_ondisk(ondisk, flags,
 					     previous_name->buf,
 					     previous_name->len);
@@ -1764,16 +1772,208 @@ static void post_read_index_from(struct index_state *istate)
 	tweak_fsmonitor(istate);
 }
 
+static unsigned long load_cache_entries(struct index_state *istate, int offset, int nr, void *mmap, unsigned long start_offset)
+{
+	int i;
+	unsigned long src_offset = start_offset;
+	struct strbuf previous_name_buf = STRBUF_INIT, *previous_name;
+
+	if (istate->version == 4)
+		previous_name = &previous_name_buf;
+	else
+		previous_name = NULL;
+
+	for (i = offset; i < offset + nr; i++) {
+		struct ondisk_cache_entry *disk_ce;
+		struct cache_entry *ce;
+		unsigned long consumed;
+
+		disk_ce = (struct ondisk_cache_entry *)((char *)mmap + src_offset);
+		ce = create_from_disk(disk_ce, &consumed, previous_name, i == offset ? 0 : 1);
+		set_index_entry(istate, i, ce);
+
+		src_offset += consumed;
+	}
+	strbuf_release(&previous_name_buf);
+	return src_offset - start_offset;
+}
+
+#ifndef NO_PTHREADS
+
+/*
+ * Mostly randomly chosen cache entries per thread (it works on my machine):
+ * we want to have at least 7500 cache entries per thread for it to
+ * be worth starting a thread.
+ */
+#define THREAD_COST		(7500)
+#define IEOT_VERSION	(1)
+
+static int ce_write(git_SHA_CTX *context, int fd, void *data, unsigned int len);
+
+static int write_index_ext_header(git_SHA_CTX *context, int fd,
+	unsigned int ext, unsigned int sz);
+
+struct load_cache_entries_thread_data
+{
+	pthread_t pthread;
+	struct index_state *istate;
+	int offset;			/* starting index into the istate->cache array */
+	void *mmap;
+	unsigned long consumed;	/* return # of bytes in index file processed */
+	struct index_entry_offset_table *ieot;
+	int ieot_offset;	/* starting index into the ieot array */
+	int ieot_work;		/* count of ieot entries to process */
+};
+
+/*
+ * A thread proc to run the load_cache_entries() computation
+ * across multiple background threads.
+ */
+static void *load_cache_entries_thread(void *_data)
+{
+	struct load_cache_entries_thread_data *p = _data;
+	int i;
+
+	/* itterate across all ieot blocks assigned to this thread */
+	for (i = p->ieot_offset; i < p->ieot_offset + p->ieot_work; i++) {
+		p->consumed += load_cache_entries(p->istate, p->offset, p->ieot->entries[i].nr, p->mmap, p->ieot->entries[i].offset);
+		p->offset += p->ieot->entries[i].nr;
+	}
+	return NULL;
+}
+
+struct index_entry_offset_table *read_ieot_extension(void *mmap, size_t mmap_size)
+{
+	/*
+	 * The IEOT extension is guaranteed to be last so that it can be found
+	 * by scanning backwards from the EOF.  In addition to the regular 4-byte
+	 * extension name and 4-byte section length is network byte order, it
+	 * also stores the 4-byte extension name and section length in reverse order
+	 * at the end of the extension.
+	 *
+	 * IEOT
+	 * 4-byte length
+	 * 4-byte version
+	 * variable length extension data...
+	 * 4-byte version
+	 * 4-byte length
+	 * IEOT
+	 * <SHA1>
+	 *
+	 * If names, lengths and versions match, the extension is assumed to be valid.
+	 */
+	const char *index;
+	uint32_t extsize_leading, extsize_trailing, ext_version;
+	struct index_entry_offset_table *ieot;
+	int i, nr;
+
+	/* validate the trailing extension signature */
+	index = (const char *)mmap + mmap_size - GIT_SHA1_RAWSZ - 4;
+	if (CACHE_EXT(index) != CACHE_EXT_FASTINDEX)
+		return NULL;
+	index -= sizeof(uint32_t);
+
+	/*
+	 * Validate the offset we're going to look for the leading extension
+	 * signature is past the index header.
+	 */
+	extsize_trailing = get_be32(index);
+	if ((index - extsize_trailing) < ((const char *)mmap + 12))
+		return NULL;
+	index -= sizeof(uint32_t);
+
+	/* validate the trailing version is IEOT_VERSION */
+	ext_version = get_be32(index);
+	if (ext_version != IEOT_VERSION)
+		return NULL;
+	index -= (extsize_trailing - sizeof(uint32_t));
+
+	/* validate the leading extension signature */
+	if (CACHE_EXT(index) != CACHE_EXT_FASTINDEX)
+		return NULL;
+	index += sizeof(uint32_t);
+
+	/* validate the leading extension size */
+	extsize_leading = get_be32(index);
+	if (extsize_leading != extsize_trailing)
+		return NULL;
+	index += sizeof(uint32_t);
+
+	/* validate the leading version is IEOT_VERSION */
+	ext_version = get_be32(index);
+	if (ext_version != IEOT_VERSION)
+		return NULL;
+	index += sizeof(uint32_t);
+
+	/* extension size - leading/trailing version bytes - trailing size - trailing signature / bytes per entry */
+	nr = (extsize_leading - sizeof(uint32_t) - sizeof(uint32_t) - sizeof(uint32_t) - 4) / (sizeof(uint32_t) + sizeof(uint32_t));
+	assert(nr);
+	ieot = xmalloc(sizeof(struct index_entry_offset_table)
+		+ (nr * sizeof(struct index_entry_offset)));
+	ieot->nr = nr;
+	for (i = 0; i < nr; i++) {
+		ieot->entries[i].offset = get_be32(index);
+		index += sizeof(uint32_t);
+		ieot->entries[i].nr = get_be32(index);
+		index += sizeof(uint32_t);
+	}
+
+	return ieot;
+}
+
+static int write_ieot_extension(git_SHA_CTX *context, int fd, struct index_entry_offset_table *ieot)
+{
+	struct strbuf sb = STRBUF_INIT;
+	uint32_t buffer;
+	int i, err;
+
+	/* version */
+	put_be32(&buffer, IEOT_VERSION);
+	strbuf_add(&sb, &buffer, sizeof(uint32_t));
+
+	/* ieot */
+	for (i = 0; i < ieot->nr; i++) {
+
+		/* offset */
+		put_be32(&buffer, ieot->entries[i].offset);
+		strbuf_add(&sb, &buffer, sizeof(uint32_t));
+
+		/* count */
+		put_be32(&buffer, ieot->entries[i].nr);
+		strbuf_add(&sb, &buffer, sizeof(uint32_t));
+	}
+
+	/* version */
+	put_be32(&buffer, IEOT_VERSION);
+	strbuf_add(&sb, &buffer, sizeof(uint32_t));
+
+	/* size */
+	put_be32(&buffer, sb.len + sizeof(uint32_t) + 4);
+	strbuf_add(&sb, &buffer, sizeof(uint32_t));
+
+	/* signature */
+	put_be32(&buffer, CACHE_EXT_FASTINDEX);
+	strbuf_add(&sb, &buffer, 4);
+
+	/* leading signature and size + extension data */
+	err = write_index_ext_header(context, fd, CACHE_EXT_FASTINDEX, sb.len) < 0
+		|| ce_write(context, fd, sb.buf, sb.len) < 0;
+	strbuf_release(&sb);
+
+	return err;
+}
+
+#endif
+
 /* remember to discard_cache() before reading a different cache! */
 int do_read_index(struct index_state *istate, const char *path, int must_exist)
 {
-	int fd, i;
+	int fd;
 	struct stat st;
 	unsigned long src_offset;
 	struct cache_header *hdr;
 	void *mmap;
 	size_t mmap_size;
-	struct strbuf previous_name_buf = STRBUF_INIT, *previous_name;
 
 	if (istate->initialized)
 		return istate->cache_nr;
@@ -1810,24 +2010,75 @@ int do_read_index(struct index_state *istate, const char *path, int must_exist)
 	istate->cache = xcalloc(istate->cache_alloc, sizeof(*istate->cache));
 	istate->initialized = 1;
 
-	if (istate->version == 4)
-		previous_name = &previous_name_buf;
-	else
-		previous_name = NULL;
-
 	src_offset = sizeof(*hdr);
-	for (i = 0; i < istate->cache_nr; i++) {
-		struct ondisk_cache_entry *disk_ce;
-		struct cache_entry *ce;
-		unsigned long consumed;
+#ifdef NO_PTHREADS
+	src_offset += load_cache_entries(istate, 0, istate->cache_nr, mmap, src_offset);
+#else
+	if (git_config_get_fast_index() != 1) {
+		src_offset += load_cache_entries(istate, 0, istate->cache_nr, mmap, src_offset);
+	} else {
+		struct index_entry_offset_table *ieot;
+		int threads, cpus = online_cpus();
 
-		disk_ce = (struct ondisk_cache_entry *)((char *)mmap + src_offset);
-		ce = create_from_disk(disk_ce, &consumed, previous_name);
-		set_index_entry(istate, i, ce);
+		threads = istate->cache_nr / THREAD_COST;
+		if (threads > cpus)
+			threads = cpus;
 
-		src_offset += consumed;
+		/* enable testing with fewer than default minimum of entries */
+		if (threads < 2 && getenv("GIT_FASTINDEX_TEST"))
+			threads = 2;
+
+		/*
+		 * Locate and read the fast index extension so that we can use it
+		 * to multi-thread the reading of the cache entries.
+		 */
+		ieot = read_ieot_extension(mmap, mmap_size);
+		if (threads < 2 || !ieot) {
+			src_offset += load_cache_entries(istate, 0, istate->cache_nr, mmap, src_offset);
+		} else {
+			int i, offset, ieot_work, ieot_offset;
+			struct load_cache_entries_thread_data *data;
+
+			/* ensure we have no more threads than we have blocks to process */
+			if (threads > ieot->nr)
+				threads = ieot->nr;
+			data = xcalloc(threads, sizeof(struct load_cache_entries_thread_data));
+
+			offset = ieot_offset = 0;
+			ieot_work = DIV_ROUND_UP(ieot->nr, threads);
+			for (i = 0; i < threads; i++) {
+				struct load_cache_entries_thread_data *p = &data[i];
+				int j;
+
+				if (ieot_offset + ieot_work > ieot->nr)
+					ieot_work = ieot->nr - ieot_offset;
+
+				p->istate = istate;
+				p->offset = offset;
+				p->mmap = mmap;
+				p->ieot = ieot;
+				p->ieot_offset = ieot_offset;
+				p->ieot_work = ieot_work;
+				if (pthread_create(&p->pthread, NULL, load_cache_entries_thread, p))
+					die("unable to create threaded load_cache_entries");
+
+				/* increment by the number of cache entries in the ieot block being processed */
+				for (j = 0; j < ieot_work; j++)
+					offset += ieot->entries[ieot_offset + j].nr;
+				ieot_offset += ieot_work;
+			}
+			for (i = 0; i < threads; i++) {
+				struct load_cache_entries_thread_data *p = data + i;
+				if (pthread_join(p->pthread, NULL))
+					die("unable to join threaded load_cache_entries");
+				src_offset += p->consumed;
+			}
+			free(data);
+		}
+		free(ieot);
 	}
-	strbuf_release(&previous_name_buf);
+#endif
+
 	istate->timestamp.sec = st.st_mtime;
 	istate->timestamp.nsec = ST_MTIME_NSEC(st);
 
@@ -2244,6 +2495,9 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	struct ondisk_cache_entry_extended ondisk;
 	struct strbuf previous_name_buf = STRBUF_INIT, *previous_name;
 	int drop_cache_tree = 0;
+	int ieot_work = 1;
+	struct index_entry_offset_table *ieot = NULL;
+	int offset, nr;
 
 	for (i = removed = extended = 0; i < entries; i++) {
 		if (cache[i]->ce_flags & CE_REMOVE)
@@ -2277,6 +2531,22 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 	if (ce_write(&c, newfd, &hdr, sizeof(hdr)) < 0)
 		return -1;
 
+	if (!strip_extensions && core_fast_index) {
+		int ieot_blocks, cpus = online_cpus();
+
+		ieot_blocks = istate->cache_nr / THREAD_COST;
+		if (ieot_blocks < 1)
+			ieot_blocks = 1;
+		if (ieot_blocks > cpus)
+			ieot_blocks = cpus;
+		ieot = xcalloc(1, sizeof(struct index_entry_offset_table)
+			+ (ieot_blocks * sizeof(struct index_entry_offset)));
+		ieot->nr = 0;
+		ieot_work = DIV_ROUND_UP(entries, ieot_blocks);
+	}
+
+	offset = lseek(newfd, 0, SEEK_CUR) + write_buffer_len;
+	nr = 0;
 	previous_name = (hdr_version == 4) ? &previous_name_buf : NULL;
 
 	for (i = 0; i < entries; i++) {
@@ -2298,11 +2568,30 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 
 			drop_cache_tree = 1;
 		}
+		if (ieot && i && (i % ieot_work == 0)) {
+			ieot->entries[ieot->nr].nr = nr;
+			ieot->entries[ieot->nr].offset = offset;
+			ieot->nr++;
+			/*
+			 * If we have a V4 index, set the first byte to an invalid
+			 * character to ensure there is nothing common with the previous
+			 * entry
+			 */
+			if (previous_name)
+				previous_name->buf[0] = 0;
+			nr = 0;
+			offset = lseek(newfd, 0, SEEK_CUR) + write_buffer_len;
+		}
 		if (ce_write_entry(&c, newfd, ce, previous_name, (struct ondisk_cache_entry *)&ondisk) < 0)
 			err = -1;
-
 		if (err)
 			break;
+		nr++;
+	}
+	if (ieot && nr) {
+		ieot->entries[ieot->nr].nr = nr;
+		ieot->entries[ieot->nr].offset = offset;
+		ieot->nr++;
 	}
 	strbuf_release(&previous_name_buf);
 
@@ -2360,6 +2649,18 @@ static int do_write_index(struct index_state *istate, struct tempfile *tempfile,
 		err = write_index_ext_header(&c, newfd, CACHE_EXT_FSMONITOR, sb.len) < 0
 			|| ce_write(&c, newfd, sb.buf, sb.len) < 0;
 		strbuf_release(&sb);
+		if (err)
+			return -1;
+	}
+
+	/*
+	 * CACHE_EXT_FASTINDEX must be written as the last entry before the SHA1
+	 * so that it can be found and processed before all the index entries are
+	 * read.
+	 */
+	if (!strip_extensions && ieot) {
+		err = write_ieot_extension(&c, newfd, ieot);
+		free(ieot);
 		if (err)
 			return -1;
 	}

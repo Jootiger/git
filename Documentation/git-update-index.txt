@@ -21,6 +21,7 @@ SYNOPSIS
 	     [--[no-]split-index]
 	     [--[no-|test-|force-]untracked-cache]
 	     [--[no-]fsmonitor]
+	     [--[no-]fastindex]
 	     [--really-refresh] [--unresolve] [--again | -g]
 	     [--info-only] [--index-info]
 	     [-z] [--stdin] [--index-version <n>]
@@ -217,6 +218,16 @@ will remove the intended effect of the option.
 	is emitted when the change goes against the configured value, as
 	the configured value will take effect next time the index is
 	read and this will remove the intended effect of the option.
+
+--fastindex::
+--no-fastindex::
+	Enable or disable the fast index feature. These options
+	take effect whatever the value of the `core.fastindex`
+	configuration variable (see linkgit:git-config[1]). But a warning
+	is emitted when the change goes against the configured value, as
+	the configured value will take effect next time the index is
+	read and this will remove the intended effect of the option.
+
 
 \--::
 	Do not interpret any more arguments as options.

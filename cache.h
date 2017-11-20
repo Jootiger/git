@@ -816,6 +816,7 @@ extern char *git_replace_ref_base;
 
 extern int fsync_object_files;
 extern int core_preload_index;
+extern int core_fast_index;
 extern int core_apply_sparse_checkout;
 extern int precomposed_unicode;
 extern int protect_hfs;
@@ -1975,5 +1976,29 @@ void safe_create_dir(const char *dir, int share);
 
 /* Return 1 if the file is empty or does not exists, 0 otherwise. */
 extern int is_empty_or_missing_file(const char *filename);
+
+
+#ifndef NO_PTHREADS
+struct index_entry_offset
+{
+	/* starting byte offset into index file, count of index entries in this block */
+	int offset, nr;
+};
+
+struct index_entry_offset_table
+{
+	int nr;
+	struct index_entry_offset entries[0];
+};
+
+extern struct index_entry_offset_table *read_ieot_extension(void *mmap, size_t mmap_size);
+
+struct ondisk_cache_entry;
+extern struct cache_entry *create_from_disk(struct ondisk_cache_entry *ondisk,
+	unsigned long *ent_size,
+	struct strbuf *previous_name,
+	int use_length);
+
+#endif
 
 #endif /* CACHE_H */
